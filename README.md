@@ -29,6 +29,8 @@
 
 **Subspace Sentinel** is your shipboard LCARS security module for auditing email authentication infrastructure. It sweeps every layer of your mail defence grid — from SPF deflector shields to DMARC command directives — then files a complete tactical report, with optional AI-assisted analysis from your choice of holographic advisor.
 
+It also tries to infer the **active mail provider** and the **DNS host / registrar control plane** from MX, SPF, NS, and SOA hints so the remediation output can tell you not just what MX records to publish, but where you are most likely to add them.
+
 *No phaser required. Python 3 is sufficient.*
 
 ---
@@ -49,7 +51,10 @@
 │                                                 provider-aware heuristics,  │
 │                                                 RSA/Ed25519 hardening       │
 │  MX            · Transporter pad registry       MX hygiene, null MX,       │
-│                                                 A/AAAA fallback risk        │
+│                                                 A/AAAA fallback risk,      │
+│                                                 provider-aware examples    │
+│  DNS Host Hint · Starbase operations console    Likely DNS control panel   │
+│                                                 for MX/TXT/CNAME changes   │
 │  SMTP STARTTLS · Secure hailing channel         Live TLS negotiation,       │
 │                                                 cipher and version probe    │
 │  DNSSEC        · Navigation beacon integrity    DS + DNSKEY presence        │
@@ -79,8 +84,8 @@
 
 ```bash
 # Beam aboard the source code
-git clone https://github.com/venkatas/obsidian.git
-cd obsidian
+git clone https://github.com/venkatas/subspace-sentinel.git
+cd subspace-sentinel
 
 # Power up the dilithium crystals
 python3 -m pip install -r requirements.txt
@@ -173,6 +178,19 @@ python3 email_auth_audit.py example.com \
   --env-file /path/to/.env
 ```
 
+### Provider and registrar-aware guidance
+
+```bash
+# See likely mail provider and DNS host / registrar hint
+python3 email_auth_audit.py example.com --ai-provider none
+```
+
+When MX is missing and the tool can infer a provider, the remediation output now includes:
+
+- provider-specific MX examples
+- a DNS host hint such as `GoDaddy`
+- operator steps showing where to add the records
+
 ---
 
 ## 📊 SAMPLE TACTICAL REPORT
@@ -184,6 +202,7 @@ Domain: enterprise.starfleet
 Input type: domain
 DNS backend: dnspython
 Mail provider guess: Google Workspace
+DNS host hint: GoDaddy
 Overall risk: HIGH
 
 Checks
@@ -211,6 +230,11 @@ Remediation Plan
     Why: p=none gives Romulans full impersonation capability.
     Step: Add rua= for aggregate reports and monitor for 2-4 weeks.
     Step: Move to p=quarantine, then p=reject.
+  [INFO] Provider-specific validation checklist
+    Why: The domain appears to use Google Workspace; validate DNS settings against that provider's mail documentation.
+    Step: DNS appears to be hosted at GoDaddy; use that control panel to add or update MX, TXT, and CNAME records.
+    Step: Sign in to GoDaddy, open My Products, and choose DNS for the domain.
+    Step: In the DNS records page, add or edit MX records at the root of the domain (@).
 ```
 
 ---
