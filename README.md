@@ -116,6 +116,34 @@ Configure your AI analyst in `.env`. All advisors are **advisory only** — the 
 
 ---
 
+## 🛰️ WORKS WITHOUT AI
+
+Subspace Sentinel does **not** require Ollama, Claude, OpenAI, or any other AI provider to work.
+
+All core scanning and remediation logic is deterministic and runs locally:
+
+- domain and email-address audits
+- SPF, DMARC, DKIM, MX, DNSSEC, MTA-STS, TLS-RPT, and BIMI checks
+- message and header analysis
+- bulk scans
+- provider and DNS-host hints
+
+Run it without AI like this:
+
+```bash
+python3 email_auth_audit.py example.com --ai-provider none
+```
+
+Or set it once in `.env`:
+
+```env
+EMAIL_AUDIT_AI_PROVIDER=none
+```
+
+AI only adds optional commentary. It does not determine whether a record exists or whether a check passes.
+
+---
+
 ## 📟 TACTICAL COMMANDS
 
 ### Single-target deep scan
