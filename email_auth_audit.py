@@ -27,7 +27,6 @@ Examples:
 
 import argparse
 import base64
-import concurrent.futures
 import email
 import json
 import os
@@ -93,6 +92,16 @@ MX_PROVIDER_PATTERNS = {
     "Fastmail": ["messagingengine.com"],
     "Yahoo": ["yahoodns.net", "yahoodns.com"],
     "Cisco Secure Email": ["iphmx.com"],
+}
+
+DNS_HOST_HINT_PATTERNS = {
+    "GoDaddy": ["domaincontrol.com", "jomax.net"],
+    "Cloudflare": ["cloudflare.com"],
+    "Amazon Route 53": ["awsdns", "route53"],
+    "Squarespace": ["squarespacedns.com"],
+    "Namecheap": ["registrar-servers.com"],
+    "Bluehost": ["bluehost.com"],
+    "DigitalOcean": ["digitalocean.com"],
 }
 
 AI_PROVIDER_ALIASES = {
@@ -525,10 +534,10 @@ def parse_arc_authentication_results_header(value: str) -> Dict[str, Any]:
             match = re.search(pattern, details, flags=re.IGNORECASE)
             if not match:
                 continue
-            matched_val = match.group(1).lower()
+            value = match.group(1).lower()
             if key.endswith("_domain"):
-                matched_val = normalize_auth_domain(matched_val) or matched_val
-            parsed["upstream"][key] = matched_val
+                value = normalize_auth_domain(value) or value
+            parsed["upstream"][key] = value
 
     return parsed
 
@@ -867,6 +876,38 @@ def detect_provider(mx_hosts: List[str]) -> Optional[str]:
     return None
 
 
+def infer_provider_from_domain_hints(
+    domain: str,
+    dns_client: "DNSClient",
+    spf_record: Optional[str],
+) -> Optional[str]:
+    lowered_spf = (spf_record or "").lower()
+    txt_records = [record.lower() for record in dns_client.query(domain, "TXT")]
+
+    if "spf.protection.outlook.com" in lowered_spf or any("onmicrosoft.com" in record for record in txt_records):
+        return "Microsoft 365"
+    if "_spf.google.com" in lowered_spf:
+        return "Google Workspace"
+    if "zohomail" in lowered_spf or any("zoho-verification" in record for record in txt_records):
+        return "Zoho Mail"
+    return None
+
+
+def infer_dns_host_hint(domain: str, dns_client: "DNSClient") -> Optional[str]:
+    records = [record.lower().rstrip(".") for record in dns_client.query(domain, "NS")]
+    soa_records = dns_client.query(domain, "SOA")
+    for soa_record in soa_records:
+        parts = soa_record.lower().split()
+        if len(parts) >= 2:
+            records.extend([parts[0].rstrip("."), parts[1].rstrip(".")])
+
+    for provider, patterns in DNS_HOST_HINT_PATTERNS.items():
+        for record in records:
+            if any(pattern in record for pattern in patterns):
+                return provider
+    return None
+
+
 def parse_mx_records(raw_records: List[str]) -> List[Dict[str, Any]]:
     parsed = []
     for record in raw_records:
@@ -1081,7 +1122,6 @@ def audit_spf(domain: str, dns_client: DNSClient, target_type: str) -> Dict[str,
     for token in tokens[1:]:
         normalized = token.lstrip("+-~?")
         if normalized == "all":
-            # RFC 7208 §4.6.1: default qualifier is "+" when none is specified.
             all_mechanism = token[0] if token[0] in "+-~?" else "+"
             break
     result["all_mechanism"] = all_mechanism
@@ -1640,14 +1680,22 @@ def probe_smtp_starttls(host: str, timeout: float) -> Dict[str, Any]:
     return outcome
 
 
-def audit_mx(domain: str, dns_client: DNSClient, target_type: str, smtp_probe: bool, timeout: float) -> Dict[str, Any]:
+def audit_mx(
+    domain: str,
+    dns_client: DNSClient,
+    target_type: str,
+    smtp_probe: bool,
+    timeout: float,
+    provider_hint: Optional[str] = None,
+) -> Dict[str, Any]:
     issues = []
     raw_mx = dns_client.query(domain, "MX")
     mx_records = parse_mx_records(raw_mx)
+    provider_guess = detect_provider([record["host"] for record in mx_records]) or provider_hint
 
     result = {
         "mx_records": mx_records,
-        "provider_guess": detect_provider([record["host"] for record in mx_records]),
+        "provider_guess": provider_guess,
         "accepts_mail": bool(mx_records),
         "status": "info",
         "issues": [],
@@ -1682,7 +1730,10 @@ def audit_mx(domain: str, dns_client: DNSClient, target_type: str, smtp_probe: b
             )
         result["status"] = classify_check_status(issues)
         result["issues"] = issues_to_dicts(issues)
-        result["summary"] = "No MX records found"
+        if provider_guess:
+            result["summary"] = "No MX records found; likely provider hint: {0}".format(provider_guess)
+        else:
+            result["summary"] = "No MX records found"
         return result
 
     if len(mx_records) == 1 and mx_records[0]["host"] == "":
@@ -2187,6 +2238,10 @@ def derive_cross_findings(results: Dict[str, Any]) -> List[Issue]:
     return issues
 
 
+def severity_badge(severity: str) -> str:
+    return severity_badge_colored(severity, use_color=True)
+
+
 def severity_badge_colored(severity: str, use_color: bool) -> str:
     if not use_color:
         return severity.upper()
@@ -2198,6 +2253,10 @@ def severity_badge_colored(severity: str, use_color: bool) -> str:
         "info": DIM,
     }
     return "{0}{1}{2}".format(colors.get(severity, ""), severity.upper(), RESET)
+
+
+def status_badge(status: str) -> str:
+    return status_badge_colored(status, use_color=True)
 
 
 def status_badge_colored(status: str, use_color: bool) -> str:
@@ -2226,6 +2285,8 @@ def render_text_report(report: Dict[str, Any], use_color: bool = True) -> str:
     lines.append("DNS backend: {0}".format(summary["dns_backend"]))
     if summary.get("provider_guess"):
         lines.append("Mail provider guess: {0}".format(summary["provider_guess"]))
+    if summary.get("dns_host_hint"):
+        lines.append("DNS host hint: {0}".format(summary["dns_host_hint"]))
     lines.append("Overall risk: {0}".format(summary["overall_risk"].upper()))
     lines.append("")
     lines.append("{0}Checks{1}".format(bold, reset))
@@ -2285,6 +2346,10 @@ def render_text_report(report: Dict[str, Any], use_color: bool = True) -> str:
             if item.get("example_record"):
                 record = item["example_record"]
                 lines.append("    Example DNS: {0} {1} {2}".format(record["name"], record["type"], record["value"]))
+            for record in item.get("example_records", []):
+                lines.append("    Example DNS: {0} {1} {2}".format(record["name"], record["type"], record["value"]))
+            if item.get("example_note"):
+                lines.append("    Note: {0}".format(item["example_note"]))
             if item.get("example_policy"):
                 lines.append("    Example policy:")
                 for policy_line in item["example_policy"].splitlines():
@@ -2748,7 +2813,7 @@ def dispatch_ai_prompt(
 
         return "AI analysis skipped: unsupported provider {0}.".format(provider)
     except urllib.error.HTTPError as exc:
-        return "AI analysis failed with HTTP {0}: {1}".format(exc.code, exc.reason)
+            return "AI analysis failed with HTTP {0}: {1}".format(exc.code, exc.reason)
     except Exception as exc:
         return "AI analysis failed: {0}".format(exc)
 
@@ -2854,7 +2919,7 @@ def calculate_overall_risk(issues: List[Issue]) -> str:
         return "medium"
     if any(issue.severity == "low" for issue in issues):
         return "low"
-    return "info"
+    return "informational"
 
 
 def sample_spf_for_provider(provider_guess: Optional[str]) -> Optional[str]:
@@ -2866,11 +2931,82 @@ def sample_spf_for_provider(provider_guess: Optional[str]) -> Optional[str]:
     return samples.get(provider_guess or "")
 
 
+def sample_mx_records_for_provider(
+    provider_guess: Optional[str],
+    domain: str,
+    spf_record: Optional[str] = None,
+) -> Tuple[List[Dict[str, str]], Optional[str]]:
+    if provider_guess == "Microsoft 365":
+        tenant_host = re.sub(r"[^a-z0-9]+", "-", domain.lower()).strip("-")
+        records = [
+            {
+                "name": domain,
+                "type": "MX",
+                "value": "0 {0}.mail.protection.outlook.com".format(tenant_host),
+            }
+        ]
+        note = "Verify the exact MX target in the Microsoft 365 admin center before publishing it."
+        return records, note
+
+    if provider_guess == "Google Workspace":
+        records = [
+            {"name": domain, "type": "MX", "value": "1 ASPMX.L.GOOGLE.COM"},
+            {"name": domain, "type": "MX", "value": "5 ALT1.ASPMX.L.GOOGLE.COM"},
+            {"name": domain, "type": "MX", "value": "5 ALT2.ASPMX.L.GOOGLE.COM"},
+            {"name": domain, "type": "MX", "value": "10 ALT3.ASPMX.L.GOOGLE.COM"},
+            {"name": domain, "type": "MX", "value": "10 ALT4.ASPMX.L.GOOGLE.COM"},
+        ]
+        return records, None
+
+    if provider_guess == "Zoho Mail":
+        lowered_spf = (spf_record or "").lower()
+        suffix = "com"
+        if "zohomail.in" in lowered_spf:
+            suffix = "in"
+        elif "zohomail.eu" in lowered_spf:
+            suffix = "eu"
+        records = [
+            {"name": domain, "type": "MX", "value": "10 mx.zoho.{0}".format(suffix)},
+            {"name": domain, "type": "MX", "value": "20 mx2.zoho.{0}".format(suffix)},
+            {"name": domain, "type": "MX", "value": "50 mx3.zoho.{0}".format(suffix)},
+        ]
+        note = "Confirm the Zoho region before publishing these MX records."
+        return records, note
+
+    return [], None
+
+
+def dns_host_update_steps(dns_host_hint: Optional[str]) -> List[str]:
+    steps = {
+        "GoDaddy": [
+            "Sign in to GoDaddy, open My Products, and choose DNS for the domain.",
+            "In the DNS records page, add or edit MX records at the root of the domain (@).",
+            "Remove stale MX records if you are replacing an older mail provider.",
+            "Save the records and allow DNS time to propagate.",
+        ],
+        "Cloudflare": [
+            "Open the domain in Cloudflare and go to DNS.",
+            "Add or edit MX records at the root of the domain (@).",
+            "Remove stale MX records if you are replacing an older mail provider.",
+            "Save the records and allow DNS time to propagate.",
+        ],
+        "Namecheap": [
+            "Open Domain List in Namecheap and choose Manage for the domain.",
+            "Go to Advanced DNS or Mail Settings and add or edit MX records at the root of the domain.",
+            "Remove stale MX records if you are replacing an older mail provider.",
+            "Save the records and allow DNS time to propagate.",
+        ],
+    }
+    return steps.get(dns_host_hint or "", [])
+
+
 def generate_domain_remediation_plan(report: Dict[str, Any]) -> List[Dict[str, Any]]:
     summary = report["summary"]
     checks = report["checks"]
     domain = summary["domain"]
     provider_guess = summary.get("provider_guess")
+    dns_host_hint = summary.get("dns_host_hint")
+    dns_host_steps = dns_host_update_steps(dns_host_hint)
     plan: List[Dict[str, Any]] = []
 
     if checks["spf"]["record"] is None:
@@ -2961,30 +3097,48 @@ def generate_domain_remediation_plan(report: Dict[str, Any]) -> List[Dict[str, A
         )
 
     if checks["mx"]["mx_records"] == [] and checks["mx"].get("accepts_mail"):
-        plan.append(
-            {
-                "priority": "medium",
-                "title": "Publish explicit MX records or a null MX",
-                "why": "The domain currently falls back to A/AAAA for mail routing, which is less explicit and easier to misread operationally.",
-                "steps": [
-                    "If the domain should receive mail, publish explicit MX records.",
-                    "If the domain should not receive mail, publish a null MX and keep SPF/DMARC strict.",
-                ],
-            }
-        )
+        mx_examples, mx_note = sample_mx_records_for_provider(provider_guess, domain, checks["spf"].get("record"))
+        action = {
+            "priority": "medium",
+            "title": "Publish explicit MX records or a null MX",
+            "why": "The domain currently falls back to A/AAAA for mail routing, which is less explicit and easier to misread operationally.",
+            "steps": [
+                "If the domain should receive mail, publish explicit MX records.",
+                "If the domain should not receive mail, publish a null MX and keep SPF/DMARC strict.",
+            ],
+        }
+        if provider_guess and mx_examples:
+            action["title"] = "Publish explicit MX records for {0}".format(provider_guess)
+            action["steps"] = [
+                "Publish explicit MX records for the active provider instead of relying on A/AAAA fallback.",
+                "Validate that the mailbox or alias exists for each address you expect to receive mail.",
+            ]
+            if dns_host_hint:
+                action["steps"].append(
+                    "Open {0} DNS management and add these MX records at the zone apex.".format(dns_host_hint)
+                )
+                action["steps"].extend(dns_host_steps)
+            action["example_records"] = mx_examples
+            if mx_note:
+                action["example_note"] = mx_note
+        plan.append(action)
 
     if summary.get("provider_guess"):
-        plan.append(
-            {
-                "priority": "info",
-                "title": "Provider-specific validation checklist",
-                "why": "The domain appears to use {0}; validate DNS settings against that provider's mail documentation.".format(summary["provider_guess"]),
-                "steps": [
-                    "Confirm DKIM selectors, SPF includes, and MX hostnames match the active provider setup.",
-                    "Validate any staged rollouts in a non-production domain before tightening alignment settings.",
-                ],
-            }
-        )
+        action = {
+            "priority": "info",
+            "title": "Provider-specific validation checklist",
+            "why": "The domain appears to use {0}; validate DNS settings against that provider's mail documentation.".format(summary["provider_guess"]),
+            "steps": [
+                "Confirm DKIM selectors, SPF includes, and MX hostnames match the active provider setup.",
+                "Validate any staged rollouts in a non-production domain before tightening alignment settings.",
+            ],
+        }
+        if dns_host_hint:
+            action["steps"].append(
+                "DNS appears to be hosted at {0}; use that control panel to add or update MX, TXT, and CNAME records.".format(dns_host_hint)
+            )
+            action["steps"].extend(dns_host_steps)
+        plan.append(action)
 
     return plan
 
@@ -3003,12 +3157,14 @@ def build_report(
 
     checks["spf"] = audit_spf(domain, dns_client, target_type)
     checks["dmarc"] = audit_dmarc(domain, dns_client, target_type)
-    checks["mx"] = audit_mx(domain, dns_client, target_type, smtp_probe, timeout)
+    provider_hint = infer_provider_from_domain_hints(domain, dns_client, checks["spf"].get("record"))
+    dns_host_hint = infer_dns_host_hint(domain, dns_client)
+    checks["mx"] = audit_mx(domain, dns_client, target_type, smtp_probe, timeout, provider_hint=provider_hint)
     checks["dkim"] = audit_dkim(
         domain,
         dns_client,
         selectors,
-        provider_guess=checks["mx"].get("provider_guess"),
+        provider_guess=checks["mx"].get("provider_guess") or provider_hint,
         spf_record=checks["spf"].get("record"),
     )
     checks["dnssec"] = audit_dnssec(domain, dns_client)
@@ -3033,13 +3189,14 @@ def build_report(
     all_issues.extend(derive_cross_findings({"checks": checks}))
     all_issues = sort_issues(all_issues)
 
-    provider_guess = checks["mx"].get("provider_guess")
+    provider_guess = checks["mx"].get("provider_guess") or provider_hint
     summary = {
         "target": target,
         "target_type": target_type,
         "domain": domain,
         "dns_backend": dns_client.backend,
         "provider_guess": provider_guess,
+        "dns_host_hint": dns_host_hint,
         "overall_risk": calculate_overall_risk(all_issues),
         "issue_counts": summarize_counts(all_issues),
         "limitations": [
@@ -3049,7 +3206,6 @@ def build_report(
     }
 
     report = {
-        "mode": "domain-audit",
         "summary": summary,
         "checks": checks,
         "issues": [asdict(issue) for issue in all_issues],
@@ -3067,11 +3223,8 @@ def collect_targets(single_target: Optional[str], targets_csv: Optional[str], ta
     if targets_csv:
         values.extend([item.strip() for item in targets_csv.split(",") if item.strip()])
     if targets_file:
-        try:
-            with open(targets_file, "r", encoding="utf-8") as handle:
-                values.extend([line.strip() for line in handle if line.strip() and not line.lstrip().startswith("#")])
-        except OSError as exc:
-            raise SystemExit("Could not read targets file {0}: {1}".format(targets_file, exc))
+        with open(targets_file, "r", encoding="utf-8") as handle:
+            values.extend([line.strip() for line in handle if line.strip() and not line.lstrip().startswith("#")])
 
     seen = set()
     deduped = []
@@ -3090,45 +3243,26 @@ def build_bulk_report(
     smtp_probe: bool,
     timeout: float,
     skip_http: bool,
-    max_workers: int = 10,
 ) -> Dict[str, Any]:
-    # Each worker gets its own DNSClient to avoid sharing resolver state across threads.
-    def _audit_target(target: str) -> Optional[Dict[str, Any]]:
-        try:
-            target_type, domain, _ = normalize_target(target)
-        except ValueError as exc:
-            print("Warning: skipping invalid target {0!r}: {1}".format(target, exc), file=sys.stderr)
-            return None
-        thread_dns = DNSClient(timeout=timeout)
-        return build_report(
+    domain_reports = []
+    portfolio_issues: List[Dict[str, Any]] = []
+
+    for target in targets:
+        target_type, domain, _ = normalize_target(target)
+        domain_report = build_report(
             target=target,
             target_type=target_type,
             domain=domain,
-            dns_client=thread_dns,
+            dns_client=dns_client,
             selectors=selectors,
             smtp_probe=smtp_probe,
             timeout=timeout,
             skip_http=skip_http,
         )
-
-    target_order = {t: i for i, t in enumerate(targets)}
-    raw_reports: List[Dict[str, Any]] = []
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(_audit_target, t): t for t in targets}
-        for future in concurrent.futures.as_completed(futures):
-            result = future.result()
-            if result is not None:
-                raw_reports.append(result)
-
-    # Restore original target ordering for deterministic output.
-    domain_reports = sorted(raw_reports, key=lambda r: target_order.get(r["summary"]["target"], 0))
-
-    portfolio_issues: List[Dict[str, Any]] = []
-    for domain_report in domain_reports:
+        domain_reports.append(domain_report)
         for issue in domain_report["issues"]:
             item = dict(issue)
-            item["domain"] = domain_report["summary"]["domain"]
+            item["domain"] = domain
             portfolio_issues.append(item)
 
     counts = {"critical": 0, "high": 0, "medium": 0, "low": 0, "info": 0}
@@ -3161,7 +3295,7 @@ def build_bulk_report(
         key=lambda item: (-SEVERITY_RANK.get(item["severity"], -1), -item["count"], item["title"]),
     )
 
-    overall_risk = "info"
+    overall_risk = "informational"
     for candidate in ("critical", "high", "medium", "low"):
         if risk_counts.get(candidate):
             overall_risk = candidate
@@ -3283,7 +3417,7 @@ def main() -> None:
             output = render_message_analysis_report(report, use_color=sys.stdout.isatty())
         elif report.get("mode") == "bulk-analysis":
             output = render_bulk_report(report, use_color=sys.stdout.isatty())
-        else:  # "domain-audit"
+        else:
             output = render_text_report(report, use_color=sys.stdout.isatty())
 
     if args.output:
@@ -3293,7 +3427,7 @@ def main() -> None:
             file_output = render_message_analysis_report(report, use_color=False)
         elif report.get("mode") == "bulk-analysis":
             file_output = render_bulk_report(report, use_color=False)
-        else:  # "domain-audit"
+        else:
             file_output = render_text_report(report, use_color=False)
         write_output(args.output, file_output)
         if not args.json:
