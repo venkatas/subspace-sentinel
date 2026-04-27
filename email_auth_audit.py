@@ -25,7 +25,7 @@ Examples:
   python3 email_auth_audit.py example.com --ai-provider claude --ai-model your-claude-model --env-file .env
 """
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 import argparse
 import base64
@@ -638,8 +638,107 @@ def collect_message_header_snapshot(message: email.message.Message, max_received
         "received_spf": message.get_all("Received-SPF", []),
         "dkim_signature": message.get_all("DKIM-Signature", [])[:max_dkim],
         "received": message.get_all("Received", [])[:max_received],
+        "x_forefront_antispam_report": message.get_all("X-Forefront-Antispam-Report", []),
+        "x_microsoft_antispam": message.get_all("X-Microsoft-Antispam", []),
+        "x_microsoft_antispam_mailbox_delivery": message.get_all("X-Microsoft-Antispam-Mailbox-Delivery", []),
+        "x_ms_exchange_organization_scl": message.get_all("X-MS-Exchange-Organization-SCL", []),
+        "x_ms_exchange_organization_authas": message.get_all("X-MS-Exchange-Organization-AuthAs", []),
+        "x_ms_exchange_organization_authsource": message.get_all("X-MS-Exchange-Organization-AuthSource", []),
+        "x_spam_status": message.get_all("X-Spam-Status", []),
+        "x_spam_score": message.get_all("X-Spam-Score", []),
     }
     return {key: value for key, value in snapshot.items() if value}
+
+
+def parse_eop_kv_header(value: str) -> Dict[str, str]:
+    parsed: Dict[str, str] = {}
+    if not value:
+        return parsed
+    for chunk in value.split(";"):
+        if ":" not in chunk:
+            continue
+        key, _, val = chunk.strip().partition(":")
+        if key:
+            parsed[key.strip().upper()] = val.strip()
+    return parsed
+
+
+def parse_eop_verdict(message: email.message.Message) -> Dict[str, Any]:
+    verdict: Dict[str, Any] = {
+        "scl": None,
+        "bcl": None,
+        "sfv": None,
+        "cat": None,
+        "cip": None,
+        "ctry": None,
+        "h": None,
+        "ptr": None,
+        "ipv": None,
+        "dest": None,
+        "ofr": None,
+        "rf": None,
+        "ucf": None,
+        "jmr": None,
+        "raw": {},
+    }
+
+    forefront = message.get("X-Forefront-Antispam-Report")
+    if forefront:
+        kv = parse_eop_kv_header(forefront)
+        verdict["raw"]["X-Forefront-Antispam-Report"] = forefront
+        for src, dst in (("SCL", "scl"), ("BCL", "bcl"), ("SFV", "sfv"), ("CAT", "cat"),
+                          ("CIP", "cip"), ("CTRY", "ctry"), ("H", "h"), ("PTR", "ptr"), ("IPV", "ipv")):
+            if src in kv:
+                verdict[dst] = kv[src]
+
+    antispam = message.get("X-Microsoft-Antispam")
+    if antispam:
+        kv = parse_eop_kv_header(antispam)
+        verdict["raw"]["X-Microsoft-Antispam"] = antispam
+        if "BCL" in kv and verdict["bcl"] is None:
+            verdict["bcl"] = kv["BCL"]
+
+    delivery = message.get("X-Microsoft-Antispam-Mailbox-Delivery")
+    if delivery:
+        kv = parse_eop_kv_header(delivery)
+        verdict["raw"]["X-Microsoft-Antispam-Mailbox-Delivery"] = delivery
+        for src, dst in (("DEST", "dest"), ("OFR", "ofr"), ("RF", "rf"), ("UCF", "ucf"), ("JMR", "jmr")):
+            if src in kv:
+                verdict[dst] = kv[src]
+
+    scl_header = message.get("X-MS-Exchange-Organization-SCL")
+    if scl_header and verdict["scl"] is None:
+        verdict["scl"] = scl_header.strip()
+
+    if verdict["scl"] is not None:
+        try:
+            verdict["scl_int"] = int(str(verdict["scl"]).strip())
+        except (TypeError, ValueError):
+            verdict["scl_int"] = None
+    else:
+        verdict["scl_int"] = None
+
+    dest_label_map = {"I": "Inbox", "J": "Junk Email", "Q": "Quarantine", "C": "Custom folder", "D": "Deleted Items"}
+    if verdict["dest"]:
+        verdict["dest_label"] = dest_label_map.get(verdict["dest"].upper(), verdict["dest"])
+
+    cat_label_map = {
+        "PHISH": "Phishing", "SPOOF": "Spoof intelligence", "HSPM": "High-confidence spam",
+        "SPM": "Spam", "BULK": "Bulk", "MALW": "Malware", "HPHSH": "High-confidence phish",
+        "UIMP": "User impersonation", "DIMP": "Domain impersonation",
+    }
+    if verdict["cat"]:
+        verdict["cat_label"] = cat_label_map.get(verdict["cat"].upper(), verdict["cat"])
+
+    sfv_label_map = {
+        "SPM": "Filtered as spam", "SKS": "Skipped (rule)", "SKA": "Skipped (allow)",
+        "SKB": "Skipped (block)", "BLK": "Blocked", "NSPM": "Not spam",
+        "SKN": "Skipped (rule, marked not spam)", "SFE": "Filter exception",
+    }
+    if verdict["sfv"]:
+        verdict["sfv_label"] = sfv_label_map.get(verdict["sfv"].upper(), verdict["sfv"])
+
+    return verdict
 
 
 def extract_urls_from_text(value: str, limit: int = 20) -> List[str]:
@@ -686,6 +785,7 @@ def assess_message_spoof_posture(
     arc_summary: Dict[str, Any],
     dkim_signature_domains: List[str],
     received_headers: List[str],
+    eop_verdict: Optional[Dict[str, Any]] = None,
 ) -> List[Issue]:
     findings: List[Issue] = []
 
@@ -779,6 +879,62 @@ def assess_message_spoof_posture(
                 ),
             )
         )
+
+    if eop_verdict:
+        cat = (eop_verdict.get("cat") or "").upper()
+        sfv = (eop_verdict.get("sfv") or "").upper()
+        scl_int = eop_verdict.get("scl_int")
+        dest = (eop_verdict.get("dest") or "").upper()
+        ofr = eop_verdict.get("ofr") or ""
+        rf = eop_verdict.get("rf") or ""
+
+        eop_evidence_bits = []
+        if scl_int is not None:
+            eop_evidence_bits.append("SCL={0}".format(scl_int))
+        if sfv:
+            eop_evidence_bits.append("SFV={0}".format(sfv))
+        if cat:
+            eop_evidence_bits.append("CAT={0}".format(cat))
+        if dest:
+            eop_evidence_bits.append("DEST={0}".format(dest))
+        if ofr:
+            eop_evidence_bits.append("OFR={0}".format(ofr))
+        if rf:
+            eop_evidence_bits.append("RF={0}".format(rf))
+
+        if cat in ("PHISH", "HPHSH", "MALW"):
+            severity = "critical"
+        elif cat in ("SPOOF", "UIMP", "DIMP", "HSPM"):
+            severity = "high"
+        elif sfv == "SPM" or (scl_int is not None and scl_int >= 5):
+            severity = "high"
+        elif dest == "J" or rf.lower() == "junkemail":
+            severity = "medium"
+        else:
+            severity = None
+
+        if severity:
+            cat_label = eop_verdict.get("cat_label") or cat or "spam/phish"
+            dest_label = eop_verdict.get("dest_label") or dest or "Junk/Quarantine"
+            findings.append(
+                make_issue(
+                    severity,
+                    "EOP Verdict",
+                    "Microsoft EOP classified this message as {0} and routed it to {1}".format(
+                        cat_label, dest_label
+                    ),
+                    "X-Forefront-Antispam-Report and mailbox-delivery headers show the receiving Exchange Online "
+                    "Protection filter's own verdict for this message: {0}.".format(
+                        ", ".join(eop_evidence_bits) or "unspecified"
+                    ),
+                    (
+                        "This is the recipient mail system's own decision, independent of SPF/DKIM/DMARC. "
+                        "Treat the message as the EOP category indicates: pull it from user mailboxes, block the "
+                        "sending IP / relay at the gateway, and review anti-phish / anti-spoof policies so future "
+                        "lookalikes are quarantined or rejected rather than delivered to Junk."
+                    ),
+                )
+            )
 
     return findings
 
@@ -882,6 +1038,8 @@ def build_message_analysis_report(message_path: str) -> Dict[str, Any]:
             )
         )
 
+    eop_verdict = parse_eop_verdict(message)
+
     issues.extend(
         assess_message_spoof_posture(
             from_domain=from_domain,
@@ -891,6 +1049,7 @@ def build_message_analysis_report(message_path: str) -> Dict[str, Any]:
             arc_summary=arc_summary,
             dkim_signature_domains=dkim_signature_domains,
             received_headers=message.get_all("Received", []),
+            eop_verdict=eop_verdict,
         )
     )
 
@@ -995,6 +1154,7 @@ def build_message_analysis_report(message_path: str) -> Dict[str, Any]:
         "combined": combined,
         "effective": effective,
         "alignment": alignment,
+        "eop_verdict": eop_verdict,
         "issues": [asdict(issue) for issue in sort_issues(issues)],
         "ai_analysis": None,
         "mode": "message-analysis",
@@ -2564,6 +2724,50 @@ def render_message_analysis_report(report: Dict[str, Any], use_color: bool = Tru
         lines.append("  Upstream SPF: {0}".format((arc_summary.get("upstream_spf") or "n/a").upper()))
         lines.append("  Upstream DKIM: {0}".format((arc_summary.get("upstream_dkim") or "n/a").upper()))
         lines.append("  Upstream DMARC: {0}".format((arc_summary.get("upstream_dmarc") or "n/a").upper()))
+
+    eop_verdict = report.get("eop_verdict") or {}
+    if any(
+        eop_verdict.get(key)
+        for key in ("scl", "sfv", "cat", "dest", "ofr", "rf", "cip", "h", "ipv")
+    ):
+        lines.append("")
+        lines.append("{0}Microsoft EOP Verdict{1}".format(bold, reset))
+        if eop_verdict.get("scl") is not None:
+            lines.append("  SCL: {0}".format(eop_verdict.get("scl")))
+        if eop_verdict.get("bcl") is not None:
+            lines.append("  BCL: {0}".format(eop_verdict.get("bcl")))
+        if eop_verdict.get("sfv"):
+            sfv_text = eop_verdict["sfv"]
+            if eop_verdict.get("sfv_label") and eop_verdict["sfv_label"] != sfv_text:
+                sfv_text = "{0} ({1})".format(sfv_text, eop_verdict["sfv_label"])
+            lines.append("  Filter verdict (SFV): {0}".format(sfv_text))
+        if eop_verdict.get("cat"):
+            cat_text = eop_verdict["cat"]
+            if eop_verdict.get("cat_label") and eop_verdict["cat_label"] != cat_text:
+                cat_text = "{0} ({1})".format(cat_text, eop_verdict["cat_label"])
+            lines.append("  Category (CAT): {0}".format(cat_text))
+        if eop_verdict.get("dest"):
+            dest_text = eop_verdict["dest"]
+            if eop_verdict.get("dest_label") and eop_verdict["dest_label"] != dest_text:
+                dest_text = "{0} ({1})".format(dest_text, eop_verdict["dest_label"])
+            lines.append("  Mailbox destination: {0}".format(dest_text))
+        if eop_verdict.get("rf"):
+            lines.append("  Resulting folder: {0}".format(eop_verdict["rf"]))
+        if eop_verdict.get("ofr"):
+            lines.append("  Override / filter (OFR): {0}".format(eop_verdict["ofr"]))
+        if eop_verdict.get("cip"):
+            ip_line = "  Sending IP: {0}".format(eop_verdict["cip"])
+            if eop_verdict.get("ctry"):
+                ip_line += " (country: {0})".format(eop_verdict["ctry"])
+            lines.append(ip_line)
+        if eop_verdict.get("h"):
+            host_line = "  HELO host (H): {0}".format(eop_verdict["h"])
+            if eop_verdict.get("ptr") and eop_verdict["ptr"] != eop_verdict["h"]:
+                host_line += " (PTR: {0})".format(eop_verdict["ptr"])
+            lines.append(host_line)
+        if eop_verdict.get("ipv"):
+            lines.append("  IP reputation verdict (IPV): {0}".format(eop_verdict["ipv"]))
+
     lines.append("")
     lines.append("{0}Findings{1}".format(bold, reset))
     if not report["issues"]:
@@ -3025,8 +3229,28 @@ def call_ai_message_analysis(
         "arc_summary": report.get("arc_summary"),
         "alignment": report["alignment"],
         "dkim_signature_domains": report["summary"].get("dkim_signature_domains", []),
+        "eop_verdict": report.get("eop_verdict"),
         "findings": report["issues"][:12],
     }
+
+    interpretation_notes = (
+        "Interpretation notes:\n"
+        "- `Authentication-Results: dmarc=none` means the receiver did not produce a DMARC pass for this message; "
+        "this can be either because the sender domain publishes no DMARC record OR because the published policy "
+        "is `p=none`. Do not assert which without an explicit DNS lookup.\n"
+        "- `compauth=fail reason=001` is Microsoft's composite-auth verdict that the message is not authentic for "
+        "the visible From; reason=001 specifically means implicit authentication failure (no DMARC pass and no "
+        "trusted alternative).\n"
+        "- `X-Forefront-Antispam-Report` carries Microsoft's own delivery verdict: SCL (spam confidence, 5+ = spam, "
+        "8/9 = high confidence phish), SFV (filter verdict; SPM = spam, NSPM = not spam), CAT (category; PHISH, "
+        "HPHSH, SPOOF, UIMP/DIMP impersonation, HSPM, BULK, MALW), CIP/H/PTR (sending IP and HELO), IPV "
+        "(IP reputation; NLI = not on a list).\n"
+        "- `X-Microsoft-Antispam-Mailbox-Delivery` shows the routing decision: dest=I/J/Q/C (Inbox / Junk / "
+        "Quarantine / Custom), OFR (override or filter that produced the move, e.g. SpamFilterAuthJ = anti-spoof "
+        "auth failure routed to Junk), RF (resulting folder).\n"
+        "- When asked why a message landed in Junk, quote the EOP verdict fields directly. The auth headers explain "
+        "*why EOP made that call*; the antispam headers explain *what call it actually made*.\n"
+    )
 
     if user_question:
         prompt = (
@@ -3036,8 +3260,9 @@ def call_ai_message_analysis(
             "If the file appears to be a sent/archive copy rather than a fully delivered message, say so clearly.\n"
             "Do NOT invent DNS posture or delivery outcomes that are not shown in the evidence.\n"
             "Be concise, explicit about confidence, and answer the question directly before adding supporting details.\n\n"
-            "User question:\n{0}\n\n"
-            "Message JSON:\n{1}".format(user_question, json.dumps(condensed, indent=2))
+            "{0}\n"
+            "User question:\n{1}\n\n"
+            "Message JSON:\n{2}".format(interpretation_notes, user_question, json.dumps(condensed, indent=2))
         )
     else:
         prompt = (
@@ -3047,7 +3272,8 @@ def call_ai_message_analysis(
             "Do NOT infer DNS posture or claim the sender domain lacks SPF, DKIM, or DMARC records unless the message evidence itself shows that.\n"
             "Explain likely causes of failures or alignment problems, note confidence limits, and give concise remediation next steps.\n"
             "Be practical and avoid speculation.\n\n"
-            "Message JSON:\n{0}".format(json.dumps(condensed, indent=2))
+            "{0}\n"
+            "Message JSON:\n{1}".format(interpretation_notes, json.dumps(condensed, indent=2))
         )
 
     return dispatch_ai_prompt(prompt, ai_settings, timeout)
