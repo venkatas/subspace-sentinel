@@ -25,7 +25,7 @@ Examples:
   python3 email_auth_audit.py example.com --ai-provider claude --ai-model your-claude-model --env-file .env
 """
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 import argparse
 import base64
@@ -777,6 +777,378 @@ KNOWN_ANONYMOUS_MAILERS = (
 EXPLICIT_AUTH_FAIL_RESULTS = ("fail", "softfail", "permerror", "policy")
 
 
+KNOWN_ESP_REDIRECTOR_DOMAINS = {
+    "campaign-statistics.com": "Sender.net",
+    "list-manage.com": "Mailchimp",
+    "mailchi.mp": "Mailchimp",
+    "createsend.com": "Campaign Monitor",
+    "cmail19.com": "Campaign Monitor",
+    "cmail20.com": "Campaign Monitor",
+    "constantcontact.com": "Constant Contact",
+    "ccsend.com": "Constant Contact",
+    "rs6.net": "Constant Contact",
+    "sendgrid.net": "SendGrid",
+    "sendgrid.com": "SendGrid",
+    "mailgun.org": "Mailgun",
+    "mailgun.net": "Mailgun",
+    "hubspotemail.net": "HubSpot",
+    "hs-sites.com": "HubSpot",
+    "hubspotlinks.com": "HubSpot",
+    "klaviyomail.com": "Klaviyo",
+    "klclick.com": "Klaviyo",
+    "kxcdn.com": "Klaviyo",
+    "amazonses.com": "Amazon SES",
+    "amazonaws.com": "Amazon SES",
+    "activehosted.com": "ActiveCampaign",
+    "sendinblue.com": "Brevo (Sendinblue)",
+    "sibforms.com": "Brevo",
+    "sib-link.com": "Brevo",
+    "postmarkapp.com": "Postmark",
+    "pmrdy.com": "Postmark",
+    "mailerlite.com": "MailerLite",
+    "ml-attach.com": "MailerLite",
+    "convertkit.com": "ConvertKit",
+    "ck-cdn.com": "ConvertKit",
+    "drip.com": "Drip",
+    "moosend.com": "Moosend",
+    "salesforce.com": "Salesforce Marketing Cloud",
+    "exct.net": "Salesforce Marketing Cloud",
+    "marketo.com": "Marketo",
+    "mktoresp.com": "Marketo",
+    "everestengagement.com": "Everest",
+    "spotler.com": "Spotler",
+}
+
+KNOWN_ESP_RDNS_PATTERNS = {
+    "Sender.net": ("sendersrv.com", "sendersrv2.com", "sendersrv3.com", "sender.net"),
+    "Mailchimp": ("mcsv.net", "mcdlv.net", "rsgsv.net"),
+    "Campaign Monitor": ("createsend.com", "cmail19.com", "cmail20.com"),
+    "SendGrid": ("sendgrid.net",),
+    "Mailgun": ("mailgun.org", "mailgun.net"),
+    "HubSpot": ("hubspotemail.net",),
+    "Klaviyo": ("klaviyomail.com",),
+    "Amazon SES": ("amazonses.com",),
+    "ActiveCampaign": ("activehosted.com",),
+    "Brevo (Sendinblue)": ("sendinblue.com", "sendibm1.com"),
+    "Postmark": ("postmarkapp.com",),
+    "MailerLite": ("mlsend.com",),
+    "Salesforce Marketing Cloud": ("exct.net",),
+}
+
+ABUSE_HEAVY_TLDS = {"xyz", "top", "click", "work", "support", "loan", "men", "racing",
+                     "review", "country", "stream", "cf", "gq", "tk", "ml", "ga"}
+NEW_GTLD_NEUTRAL = {"group", "online", "site", "store", "tech", "app", "cloud",
+                    "digital", "email", "io", "life", "world"}
+
+
+def _registrable_domain(host: str) -> str:
+    if not host:
+        return ""
+    parts = host.strip().lower().rstrip(".").split(".")
+    if len(parts) <= 2:
+        return ".".join(parts)
+    second_level_tlds = {"co.uk", "ac.uk", "gov.uk", "co.in", "gov.in", "ac.in",
+                          "com.au", "net.au", "org.au", "co.jp"}
+    last_two = ".".join(parts[-2:])
+    last_three = ".".join(parts[-3:])
+    if last_two in second_level_tlds:
+        return last_three
+    return last_two
+
+
+def _classify_tld(domain: str) -> str:
+    if not domain:
+        return "unknown"
+    parts = domain.rsplit(".", 1)
+    if len(parts) < 2:
+        return "unknown"
+    tld = parts[-1].lower()
+    if tld in ABUSE_HEAVY_TLDS:
+        return "abuse-heavy"
+    if tld in NEW_GTLD_NEUTRAL:
+        return "new-gtld-neutral"
+    if tld in {"com", "net", "org", "edu", "gov", "mil"}:
+        return "legacy"
+    if len(tld) == 2:
+        return "country-code"
+    return "other-gtld"
+
+
+def _detect_esp_from_received(received_headers: List[str]) -> Optional[str]:
+    blob = " ".join(received_headers).lower()
+    for esp, patterns in KNOWN_ESP_RDNS_PATTERNS.items():
+        for pattern in patterns:
+            if pattern in blob:
+                return esp
+    return None
+
+
+def _detect_recipient_provider(message: email.message.Message) -> str:
+    delivered_to = " ".join(message.get_all("Delivered-To", [])).lower()
+    received_blob = " ".join(message.get_all("Received", [])).lower()
+    auth_results = " ".join(message.get_all("Authentication-Results", [])).lower()
+
+    if "mx.google.com" in received_blob or "mx.google.com" in auth_results or "google.com" in delivered_to:
+        return "gmail"
+    if "protection.outlook.com" in received_blob or "outlook.com" in auth_results:
+        return "microsoft365"
+    if "yahoodns.net" in received_blob or "yahoo.com" in auth_results:
+        return "yahoo"
+    if "apple-mail" in received_blob or "icloud.com" in auth_results or "me.com" in auth_results:
+        return "icloud"
+    if "fastmail" in received_blob:
+        return "fastmail"
+    if "proton" in received_blob:
+        return "proton"
+    return "unknown"
+
+
+def assess_deliverability_posture(
+    from_domain: Optional[str],
+    return_path_domain: Optional[str],
+    body_preview: str,
+    urls: List[str],
+    received_headers: List[str],
+    message: email.message.Message,
+    auth_clean: bool,
+) -> Tuple[List[Issue], Dict[str, Any]]:
+    findings: List[Issue] = []
+    signals: Dict[str, Any] = {
+        "from_returnpath_match": None,
+        "tracking_redirector": None,
+        "tracking_pixel": False,
+        "invisible_padding": None,
+        "bulk_compliant": False,
+        "bulk_classifier_signals": [],
+        "esp_detected": None,
+        "from_tld_class": None,
+        "recipient_provider": _detect_recipient_provider(message),
+        "primary_link_domain": None,
+        "primary_link_count": 0,
+        "total_links": len(urls),
+    }
+
+    if from_domain and return_path_domain:
+        signals["from_returnpath_match"] = (
+            _registrable_domain(from_domain) == _registrable_domain(return_path_domain)
+        )
+
+    signals["esp_detected"] = _detect_esp_from_received(received_headers)
+    signals["from_tld_class"] = _classify_tld(from_domain or "")
+
+    list_unsubscribe = message.get("List-Unsubscribe")
+    list_unsubscribe_post = message.get("List-Unsubscribe-Post")
+    precedence = (message.get("Precedence") or "").strip().lower()
+    x_mailer = message.get("X-Mailer")
+    if list_unsubscribe and list_unsubscribe_post:
+        signals["bulk_compliant"] = True
+    if list_unsubscribe:
+        signals["bulk_classifier_signals"].append("List-Unsubscribe")
+    if list_unsubscribe_post:
+        signals["bulk_classifier_signals"].append("List-Unsubscribe-Post")
+    if precedence in ("bulk", "list"):
+        signals["bulk_classifier_signals"].append("Precedence:{0}".format(precedence))
+    if x_mailer:
+        signals["bulk_classifier_signals"].append("X-Mailer")
+
+    domain_counts: Dict[str, int] = {}
+    for url in urls:
+        match = re.match(r"https?://([^/?#]+)", url, flags=re.IGNORECASE)
+        if not match:
+            continue
+        host = match.group(1).lower()
+        registrable = _registrable_domain(host)
+        if not registrable:
+            continue
+        domain_counts[registrable] = domain_counts.get(registrable, 0) + 1
+
+    if domain_counts:
+        primary_domain, primary_count = max(domain_counts.items(), key=lambda kv: kv[1])
+        signals["primary_link_domain"] = primary_domain
+        signals["primary_link_count"] = primary_count
+        from_reg = _registrable_domain(from_domain or "")
+        if (
+            primary_count >= 3
+            and primary_domain != from_reg
+            and primary_count >= max(2, len(urls) // 2)
+        ):
+            esp_label = KNOWN_ESP_REDIRECTOR_DOMAINS.get(primary_domain)
+            signals["tracking_redirector"] = {
+                "domain": primary_domain,
+                "count": primary_count,
+                "total_urls": len(urls),
+                "esp": esp_label,
+            }
+
+    pixel_pattern = re.compile(
+        r"<img[^>]+(?:width\s*=\s*[\"']?1[\"']?[^>]+height\s*=\s*[\"']?1[\"']?|src\s*=\s*[\"'][^\"']*?(?:/email_open/|/open/|/track(?:er)?/open|/pixel|/beacon|/o\.gif|/open\.gif))",
+        flags=re.IGNORECASE,
+    )
+    raw_html_parts: List[str] = []
+    if message.is_multipart():
+        for part in message.walk():
+            if part.get_content_type().lower() == "text/html":
+                try:
+                    raw_html_parts.append(str(part.get_content()))
+                except Exception:
+                    continue
+    elif message.get_content_type().lower() == "text/html":
+        try:
+            raw_html_parts.append(str(message.get_content()))
+        except Exception:
+            pass
+    if any(pixel_pattern.search(part) for part in raw_html_parts):
+        signals["tracking_pixel"] = True
+
+    zwnj_count = body_preview.count("‌")
+    nbsp_count = body_preview.count(" ")
+    invisible_run_match = re.search(r"(?:[​-‏ ⁠﻿]\s*){10,}", body_preview)
+    if zwnj_count > 0 or nbsp_count > 0 or invisible_run_match:
+        snippet_window = body_preview[:600]
+        early_zwnj = snippet_window.count("‌")
+        if zwnj_count >= 30 or (zwnj_count - early_zwnj) >= 15 or (
+            invisible_run_match and len(invisible_run_match.group(0)) > 80
+        ):
+            kind = "padding"
+        elif zwnj_count > 0 and zwnj_count <= 30 and (zwnj_count - early_zwnj) <= 5:
+            kind = "preheader-spacer"
+        else:
+            kind = "padding"
+        signals["invisible_padding"] = {
+            "kind": kind,
+            "zwnj_count": zwnj_count,
+            "nbsp_count": nbsp_count,
+        }
+
+    if not auth_clean:
+        return findings, signals
+
+    if signals["tracking_redirector"]:
+        td = signals["tracking_redirector"]
+        esp_text = " ({0})".format(td["esp"]) if td["esp"] else ""
+        findings.append(
+            make_issue(
+                "info",
+                "Deliverability",
+                "All call-to-action links wrapped through a tracking redirector",
+                "{0} of {1} URLs in the body resolve to {2}{3} rather than the brand domain ({4}). "
+                "Recipient classifiers treat this as a strong commercial-mail signal.".format(
+                    td["count"], td["total_urls"], td["domain"], esp_text, from_domain or "n/a"
+                ),
+                "Normal for ESP campaigns; reduces inbox-rate when sending to recipients with no prior engagement. "
+                "Mix in an unwrapped brand link or send transactional mail through a separate stream.",
+            )
+        )
+
+    if signals["tracking_pixel"]:
+        findings.append(
+            make_issue(
+                "info",
+                "Deliverability",
+                "Open-tracking pixel present in HTML body",
+                "The HTML body contains a 1x1 image / open-tracking beacon. Combined with link wrapping it forms a "
+                "classic mass-marketing fingerprint.",
+                "Acceptable for explicit-opt-in marketing; remove from transactional or one-to-one mail.",
+            )
+        )
+
+    if signals["invisible_padding"] and signals["invisible_padding"]["kind"] == "padding":
+        findings.append(
+            make_issue(
+                "low",
+                "Deliverability",
+                "Heavy invisible-character padding in the body",
+                "The body contains {0} zero-width non-joiner and {1} non-breaking space characters in a pattern that "
+                "matches anti-fingerprinting padding rather than a normal preheader spacer. Several mailbox providers "
+                "down-rank messages containing long runs of invisible characters.".format(
+                    signals["invisible_padding"]["zwnj_count"],
+                    signals["invisible_padding"]["nbsp_count"],
+                ),
+                "Remove the invisible-character padding; if a preheader is needed, use a single short visible-text "
+                "preheader instead.",
+            )
+        )
+    elif signals["invisible_padding"] and signals["invisible_padding"]["kind"] == "preheader-spacer":
+        findings.append(
+            make_issue(
+                "info",
+                "Deliverability",
+                "Preheader spacer characters detected (normal ESP pattern)",
+                "A small run of zero-width non-joiner / non-breaking space characters at the start of the body is the "
+                "standard ESP technique for controlling Gmail's snippet preview. Not a deliverability concern by itself.",
+                "No action required.",
+            )
+        )
+
+    if signals["from_returnpath_match"] is False:
+        from_reg = _registrable_domain(from_domain or "")
+        rp_reg = _registrable_domain(return_path_domain or "")
+        findings.append(
+            make_issue(
+                "info",
+                "Deliverability",
+                "From and Return-Path use different registrable domains (ESP relay pattern)",
+                "From {0} versus Return-Path {1}. DMARC accommodates this when DKIM aligns to the From domain "
+                "(which it does here), but recipient reputation engines still treat the split as an ESP / commercial "
+                "marker.".format(from_reg, rp_reg),
+                "Improve inbox-rate by aligning the envelope sender (custom bounces.{0} subdomain on the ESP) so the "
+                "From and Return-Path share the same registrable domain.".format(from_reg or "yourdomain"),
+            )
+        )
+
+    if signals["esp_detected"]:
+        findings.append(
+            make_issue(
+                "info",
+                "Deliverability",
+                "Sent from a known ESP shared IP pool: {0}".format(signals["esp_detected"]),
+                "Reverse-DNS of the sending host matches the {0} infrastructure. Shared-pool reputation is dragged by "
+                "every other tenant on the same IP, especially for cold sends to recipients with no prior engagement.".format(
+                    signals["esp_detected"]
+                ),
+                "For higher-stakes campaigns, move to a dedicated IP after warm-up, or send transactional mail through "
+                "a separate, lower-volume stream.",
+            )
+        )
+
+    if signals["from_tld_class"] == "abuse-heavy":
+        findings.append(
+            make_issue(
+                "low",
+                "Deliverability",
+                "Sender uses an abuse-heavy TLD",
+                "The From domain TLD is in a bucket historically associated with high spam rates; mailbox providers "
+                "weight this negatively when other reputation signals are weak.",
+                "If feasible, send from a more established TLD (e.g. .com on the same brand) to reduce the cold-send penalty.",
+            )
+        )
+    elif signals["from_tld_class"] == "new-gtld-neutral":
+        findings.append(
+            make_issue(
+                "info",
+                "Deliverability",
+                "Sender uses a newer gTLD (modest reputation weight)",
+                "The From domain uses a newer gTLD. Not abuse-associated, but gets less reputation benefit than legacy "
+                "TLDs (.com / .org) when the recipient has no prior engagement.",
+                "Optional: keep the brand domain but warm up engagement before bulk sends.",
+            )
+        )
+
+    if signals["bulk_compliant"]:
+        findings.append(
+            make_issue(
+                "info",
+                "Deliverability",
+                "Bulk-sender compliance headers present (positive signal)",
+                "Both List-Unsubscribe and List-Unsubscribe-Post: One-Click are set, satisfying Gmail / Yahoo bulk-sender "
+                "requirements. This is a positive signal, not a penalty.",
+                "No action required.",
+            )
+        )
+
+    return findings, signals
+
+
 def assess_message_spoof_posture(
     from_domain: Optional[str],
     effective: Dict[str, Any],
@@ -1053,6 +1425,22 @@ def build_message_analysis_report(message_path: str) -> Dict[str, Any]:
         )
     )
 
+    auth_clean = (
+        effective.get("spf") == "pass"
+        and effective.get("dkim") == "pass"
+        and effective.get("dmarc") == "pass"
+    )
+    deliverability_findings, deliverability_signals = assess_deliverability_posture(
+        from_domain=from_domain,
+        return_path_domain=return_path_domain,
+        body_preview=body_preview,
+        urls=urls,
+        received_headers=message.get_all("Received", []),
+        message=message,
+        auth_clean=auth_clean,
+    )
+    issues.extend(deliverability_findings)
+
     spf_result = effective["spf"]
     if spf_result == "permerror" and arc_summary["arc"] == "pass" and arc_summary["upstream_spf"] == "pass":
         maybe_issue = make_issue(
@@ -1155,6 +1543,8 @@ def build_message_analysis_report(message_path: str) -> Dict[str, Any]:
         "effective": effective,
         "alignment": alignment,
         "eop_verdict": eop_verdict,
+        "deliverability": deliverability_signals,
+        "auth_clean": auth_clean,
         "issues": [asdict(issue) for issue in sort_issues(issues)],
         "ai_analysis": None,
         "mode": "message-analysis",
@@ -2768,6 +3158,52 @@ def render_message_analysis_report(report: Dict[str, Any], use_color: bool = Tru
         if eop_verdict.get("ipv"):
             lines.append("  IP reputation verdict (IPV): {0}".format(eop_verdict["ipv"]))
 
+    deliverability = report.get("deliverability") or {}
+    if any(
+        deliverability.get(key) is not None
+        for key in (
+            "tracking_redirector",
+            "tracking_pixel",
+            "invisible_padding",
+            "esp_detected",
+            "from_returnpath_match",
+            "bulk_compliant",
+        )
+    ):
+        lines.append("")
+        lines.append("{0}Deliverability Signals{1}".format(bold, reset))
+        provider = deliverability.get("recipient_provider") or "unknown"
+        lines.append("  Recipient provider: {0}".format(provider))
+        if deliverability.get("esp_detected"):
+            lines.append("  Sender ESP (rDNS): {0}".format(deliverability["esp_detected"]))
+        if deliverability.get("from_tld_class"):
+            lines.append("  From TLD class: {0}".format(deliverability["from_tld_class"]))
+        if deliverability.get("from_returnpath_match") is False:
+            lines.append("  From / Return-Path domains: SPLIT (ESP relay pattern)")
+        elif deliverability.get("from_returnpath_match") is True:
+            lines.append("  From / Return-Path domains: aligned")
+        td = deliverability.get("tracking_redirector")
+        if td:
+            lines.append(
+                "  Tracking redirector: {0}/{1} URLs via {2}{3}".format(
+                    td["count"],
+                    td["total_urls"],
+                    td["domain"],
+                    " ({0})".format(td["esp"]) if td.get("esp") else "",
+                )
+            )
+        if deliverability.get("tracking_pixel"):
+            lines.append("  Open-tracking pixel: present")
+        ip = deliverability.get("invisible_padding")
+        if ip:
+            lines.append(
+                "  Invisible-char padding: {0} (ZWNJ x{1}, NBSP x{2})".format(
+                    ip["kind"], ip["zwnj_count"], ip["nbsp_count"]
+                )
+            )
+        if deliverability.get("bulk_compliant"):
+            lines.append("  Bulk compliance (List-Unsubscribe + One-Click): yes")
+
     lines.append("")
     lines.append("{0}Findings{1}".format(bold, reset))
     if not report["issues"]:
@@ -3230,8 +3666,15 @@ def call_ai_message_analysis(
         "alignment": report["alignment"],
         "dkim_signature_domains": report["summary"].get("dkim_signature_domains", []),
         "eop_verdict": report.get("eop_verdict"),
+        "deliverability": report.get("deliverability"),
+        "auth_clean": report.get("auth_clean"),
         "findings": report["issues"][:12],
     }
+
+    deliverability = report.get("deliverability") or {}
+    recipient_provider = deliverability.get("recipient_provider") or "unknown"
+    auth_clean = bool(report.get("auth_clean"))
+    eop_present = bool((report.get("eop_verdict") or {}).get("raw"))
 
     interpretation_notes = (
         "Interpretation notes:\n"
@@ -3250,7 +3693,28 @@ def call_ai_message_analysis(
         "auth failure routed to Junk), RF (resulting folder).\n"
         "- When asked why a message landed in Junk, quote the EOP verdict fields directly. The auth headers explain "
         "*why EOP made that call*; the antispam headers explain *what call it actually made*.\n"
+        "- Recipient provider for this message: {0}.\n".format(recipient_provider)
     )
+
+    if recipient_provider == "gmail" and not eop_present:
+        interpretation_notes += (
+            "- IMPORTANT: Gmail does NOT expose its per-message spam verdict in the headers. There is no "
+            "X-Gmail-Spam-Score, no SCL, no CAT field. Any explanation of why a Gmail message went to Spam vs "
+            "Inbox vs Promotions is INFERENCE, not evidence. Lead with that caveat. Reason from contributing "
+            "signals only — do NOT assert what Gmail decided or quote a verdict that does not exist.\n"
+            "- For Gmail, the dominant factor is per-recipient sender reputation (engagement history). With no "
+            "prior engagement between the recipient and the sender, even cleanly-authenticated bulk mail commonly "
+            "lands in Spam or Promotions.\n"
+        )
+
+    if auth_clean:
+        interpretation_notes += (
+            "- AUTH IS CLEAN for this message (SPF, DKIM, and DMARC all passed). Do NOT recommend fixing SPF, "
+            "DKIM, or DMARC. Do NOT suggest moving DMARC to quarantine/reject — it already is, or it does not "
+            "apply. If asked why a clean-auth message landed in Spam, focus on the deliverability signals "
+            "(tracking/wrapping, invisible-character padding, ESP relay pattern, sender reputation, engagement "
+            "history) rather than authentication.\n"
+        )
 
     if user_question:
         prompt = (
