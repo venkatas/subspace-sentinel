@@ -25,7 +25,7 @@ Examples:
   python3 email_auth_audit.py example.com --ai-provider claude --ai-model your-claude-model --env-file .env
 """
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 import argparse
 import base64
@@ -440,6 +440,8 @@ def parse_authentication_results_header(value: str) -> Dict[str, Any]:
         "dmarc": None,
         "dmarc_domain": None,
         "arc": None,
+        "compauth": None,
+        "compauth_reason": None,
     }
     direct_value = parsed["direct_raw"]
 
@@ -448,6 +450,7 @@ def parse_authentication_results_header(value: str) -> Dict[str, Any]:
         ("dkim", r"\bdkim=(pass|fail|policy|neutral|temperror|permerror|none)\b"),
         ("dmarc", r"\bdmarc=(pass|fail|bestguesspass|temperror|permerror|none)\b"),
         ("arc", r"\barc=(pass|fail|none)\b"),
+        ("compauth", r"\bcompauth=(pass|fail|softpass|none)\b"),
     ]
     for key, pattern in patterns:
         match = re.search(pattern, direct_value, flags=re.IGNORECASE)
@@ -470,6 +473,12 @@ def parse_authentication_results_header(value: str) -> Dict[str, Any]:
             parsed["dkim_domain"] = extracted.lstrip("@") if extracted else None
             continue
         parsed[key] = extracted
+
+    compauth_reason_match = re.search(
+        r"\bcompauth=[a-z]+\s+reason=([0-9a-zA-Z]+)", direct_value, flags=re.IGNORECASE
+    )
+    if compauth_reason_match:
+        parsed["compauth_reason"] = compauth_reason_match.group(1)
 
     return parsed
 
@@ -655,6 +664,125 @@ def issue_from_result(result: Optional[str], good_values: Tuple[str, ...], area:
     return make_issue(severity, area, title, detail, recommendation)
 
 
+KNOWN_ANONYMOUS_MAILERS = (
+    "emkei.cz",
+    "anonymailer.net",
+    "anonymousemail.me",
+    "deadfake.com",
+    "sendanonymousemail.net",
+    "guerrillamail.com",
+    "mailinator.com",
+    "yopmail.com",
+)
+
+EXPLICIT_AUTH_FAIL_RESULTS = ("fail", "softfail", "permerror", "policy")
+
+
+def assess_message_spoof_posture(
+    from_domain: Optional[str],
+    effective: Dict[str, Any],
+    alignment: Dict[str, bool],
+    combined: Dict[str, Any],
+    arc_summary: Dict[str, Any],
+    dkim_signature_domains: List[str],
+    received_headers: List[str],
+) -> List[Issue]:
+    findings: List[Issue] = []
+
+    if not from_domain:
+        return findings
+
+    spf_aligned_pass = effective.get("spf") == "pass" and alignment.get("spf_relaxed")
+    dkim_aligned_pass = effective.get("dkim") == "pass" and alignment.get("dkim_relaxed")
+    dmarc_pass = effective.get("dmarc") == "pass"
+    arc_chain_pass = arc_summary.get("arc") == "pass" and (
+        arc_summary.get("upstream_dkim") == "pass" or arc_summary.get("upstream_spf") == "pass"
+    )
+
+    has_aligned_pass = spf_aligned_pass or dkim_aligned_pass or dmarc_pass or arc_chain_pass
+
+    spf_explicit = effective.get("spf") in EXPLICIT_AUTH_FAIL_RESULTS
+    dkim_missing_or_failed = effective.get("dkim") in (None, "none") + EXPLICIT_AUTH_FAIL_RESULTS and not dkim_signature_domains
+    dmarc_missing_or_failed = effective.get("dmarc") in (None, "none") + EXPLICIT_AUTH_FAIL_RESULTS
+
+    received_blob = " ".join(received_headers).lower()
+    matched_relays = [host for host in KNOWN_ANONYMOUS_MAILERS if host in received_blob]
+    compauth_failed = combined.get("compauth") == "fail"
+
+    if not has_aligned_pass and (spf_explicit or dkim_missing_or_failed or dmarc_missing_or_failed):
+        severity = "high"
+        if compauth_failed or matched_relays or effective.get("dmarc") in ("fail", "permerror"):
+            severity = "critical"
+
+        evidence_bits = []
+        evidence_bits.append("SPF={0}".format((effective.get("spf") or "none").upper()))
+        evidence_bits.append("DKIM={0}".format((effective.get("dkim") or "none").upper()))
+        evidence_bits.append("DMARC={0}".format((effective.get("dmarc") or "none").upper()))
+        if combined.get("compauth"):
+            evidence_bits.append("compauth={0}".format(combined["compauth"].upper()))
+
+        detail = (
+            "The message displays From: {0} but no aligned SPF/DKIM/DMARC pass was produced for that domain "
+            "({1}). The recipient mail system delivered an unauthenticated message that presents itself as the "
+            "stated sender, so a user opening the inbox would see a spoof.".format(
+                from_domain, ", ".join(evidence_bits)
+            )
+        )
+        findings.append(
+            make_issue(
+                severity,
+                "Spoof Posture",
+                "Delivered message is unauthenticated as the visible sender",
+                detail,
+                (
+                    "Treat as a likely spoof of {0}. Quarantine or block at the gateway, alert the recipient, "
+                    "and verify the sender's published DMARC policy is set to quarantine or reject so future "
+                    "lookalikes do not land in the inbox.".format(from_domain)
+                ),
+            )
+        )
+
+    if compauth_failed:
+        reason = combined.get("compauth_reason")
+        detail = "The receiving mail system flagged composite authentication as FAIL"
+        if reason:
+            detail += " (reason {0})".format(reason)
+        detail += (
+            ". This is the receiver's own verdict that the message is inauthentic for the visible From "
+            "domain {0}.".format(from_domain)
+        )
+        findings.append(
+            make_issue(
+                "critical",
+                "Spoof Posture",
+                "Receiver flagged composite authentication failure (compauth=fail)",
+                detail,
+                (
+                    "Investigate as a confirmed spoof attempt. Pull the original message from the recipient mailbox, "
+                    "check for additional recipients, and tighten transport rules so compauth=fail messages are not "
+                    "delivered to user inboxes."
+                ),
+            )
+        )
+
+    if matched_relays:
+        findings.append(
+            make_issue(
+                "high",
+                "Spoof Posture",
+                "Sender path traverses a known anonymous mailer service",
+                "The Received chain shows the message was relayed through {0}, which is a public service used to "
+                "send mail under arbitrary From addresses.".format(", ".join(sorted(set(matched_relays)))),
+                (
+                    "Block the relay at the gateway, treat the message as a spoof regardless of authentication results, "
+                    "and confirm whether other users received traffic from the same source."
+                ),
+            )
+        )
+
+    return findings
+
+
 def build_message_analysis_report(message_path: str) -> Dict[str, Any]:
     message = read_message_file(message_path)
     body_preview = extract_message_body_preview(message)
@@ -690,6 +818,8 @@ def build_message_analysis_report(message_path: str) -> Dict[str, Any]:
         "dmarc_domain": next((item.get("dmarc_domain") for item in auth_results if item.get("dmarc_domain")), None),
         "arc": next((item.get("arc") for item in auth_results if item.get("arc")), None),
         "received_spf": next((item.get("result") for item in received_spf if item.get("result")), None),
+        "compauth": next((item.get("compauth") for item in auth_results if item.get("compauth")), None),
+        "compauth_reason": next((item.get("compauth_reason") for item in auth_results if item.get("compauth_reason")), None),
     }
 
     if not combined["dkim_domain"] and dkim_signature_domains:
@@ -751,6 +881,18 @@ def build_message_analysis_report(message_path: str) -> Dict[str, Any]:
                 "Capture the full delivered message including Authentication-Results if you want deterministic message-path analysis.",
             )
         )
+
+    issues.extend(
+        assess_message_spoof_posture(
+            from_domain=from_domain,
+            effective=effective,
+            alignment=alignment,
+            combined=combined,
+            arc_summary=arc_summary,
+            dkim_signature_domains=dkim_signature_domains,
+            received_headers=message.get_all("Received", []),
+        )
+    )
 
     spf_result = effective["spf"]
     if spf_result == "permerror" and arc_summary["arc"] == "pass" and arc_summary["upstream_spf"] == "pass":
