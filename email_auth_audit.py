@@ -25,10 +25,11 @@ Examples:
   python3 email_auth_audit.py example.com --ai-provider claude --ai-model your-claude-model --env-file .env
 """
 
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 
 import argparse
 import base64
+import difflib
 import email
 import json
 import os
@@ -833,6 +834,13 @@ KNOWN_ESP_RDNS_PATTERNS = {
     "Postmark": ("postmarkapp.com",),
     "MailerLite": ("mlsend.com",),
     "Salesforce Marketing Cloud": ("exct.net",),
+    "Netcore Cloud": ("ncdelivery01.com", "ncdelivery02.com", "ncdelivery03.com",
+                       "ncdelivery04.com", "ncm14.com", "ncm15.com", "ncm16.com",
+                       "netcoresmartech.com", "netcorecloud.net"),
+    "MoEngage": ("moenotify.com", "moengage.com"),
+    "WebEngage": ("webengage.com",),
+    "Zoho Campaigns": ("zoho.com", "zohomail.com", "zcsend.net"),
+    "Mailmodo": ("mailmodo.com",),
 }
 
 ABUSE_HEAVY_TLDS = {"xyz", "top", "click", "work", "support", "loan", "men", "racing",
@@ -874,6 +882,50 @@ def _classify_tld(domain: str) -> str:
     return "other-gtld"
 
 
+def _domain_base(domain: str) -> str:
+    reg = _registrable_domain(domain)
+    if "." not in reg:
+        return reg
+    return reg.split(".", 1)[0]
+
+
+def _classify_replyto_relationship(from_domain: Optional[str], replyto_domain: Optional[str]) -> Optional[Dict[str, Any]]:
+    if not from_domain or not replyto_domain:
+        return None
+    from_reg = _registrable_domain(from_domain)
+    replyto_reg = _registrable_domain(replyto_domain)
+    if not from_reg or not replyto_reg:
+        return None
+    if from_reg == replyto_reg:
+        return {"relationship": "same-registrable-domain"}
+
+    from_base = _domain_base(from_reg)
+    replyto_base = _domain_base(replyto_reg)
+    base_ratio = difflib.SequenceMatcher(a=from_base, b=replyto_base).ratio() if (from_base and replyto_base) else 0.0
+    edit_distance = None
+    if from_base and replyto_base:
+        edit_distance = sum(1 for op in difflib.ndiff(from_base, replyto_base) if op[0] in "+-")
+
+    if from_base and replyto_base and from_base != replyto_base and base_ratio >= 0.78 and (
+        edit_distance is None or edit_distance <= max(2, len(from_base) // 4)
+    ):
+        return {
+            "relationship": "lookalike",
+            "from_registrable": from_reg,
+            "replyto_registrable": replyto_reg,
+            "from_base": from_base,
+            "replyto_base": replyto_base,
+            "similarity": round(base_ratio, 3),
+            "edit_distance": edit_distance,
+        }
+
+    return {
+        "relationship": "different-registrable-domain",
+        "from_registrable": from_reg,
+        "replyto_registrable": replyto_reg,
+    }
+
+
 def _detect_esp_from_received(received_headers: List[str]) -> Optional[str]:
     blob = " ".join(received_headers).lower()
     for esp, patterns in KNOWN_ESP_RDNS_PATTERNS.items():
@@ -913,6 +965,8 @@ def assess_deliverability_posture(
     auth_clean: bool,
 ) -> Tuple[List[Issue], Dict[str, Any]]:
     findings: List[Issue] = []
+    replyto_value = message.get("Reply-To") or ""
+    replyto_domain = extract_domain_from_address(replyto_value) if replyto_value else None
     signals: Dict[str, Any] = {
         "from_returnpath_match": None,
         "tracking_redirector": None,
@@ -926,6 +980,7 @@ def assess_deliverability_posture(
         "primary_link_domain": None,
         "primary_link_count": 0,
         "total_links": len(urls),
+        "replyto_relationship": _classify_replyto_relationship(from_domain, replyto_domain),
     }
 
     if from_domain and return_path_domain:
@@ -1143,6 +1198,39 @@ def assess_deliverability_posture(
                 "Both List-Unsubscribe and List-Unsubscribe-Post: One-Click are set, satisfying Gmail / Yahoo bulk-sender "
                 "requirements. This is a positive signal, not a penalty.",
                 "No action required.",
+            )
+        )
+
+    rel = signals["replyto_relationship"]
+    if rel and rel.get("relationship") == "lookalike":
+        findings.append(
+            make_issue(
+                "medium",
+                "Deliverability",
+                "Reply-To uses a lookalike of the From domain",
+                "From {0} but Reply-To {1} (similarity {2}, edit distance {3}). Two near-identical brand spellings "
+                "across From and Reply-To matches the typosquat / lead-laundering pattern that mailbox classifiers "
+                "weight heavily even when authentication passes.".format(
+                    rel["from_registrable"], rel["replyto_registrable"],
+                    rel.get("similarity"), rel.get("edit_distance"),
+                ),
+                "If both domains are legitimately yours, consolidate replies onto the same registrable domain as "
+                "From (or a subdomain of it). If the Reply-To domain is unexpected, treat as a possible brand "
+                "impersonation or lead-laundering setup.",
+            )
+        )
+    elif rel and rel.get("relationship") == "different-registrable-domain":
+        findings.append(
+            make_issue(
+                "info",
+                "Deliverability",
+                "Reply-To uses a different registrable domain from From",
+                "From {0} but Reply-To {1}. Common with shared CRMs and sales tooling, but it weakens recipient "
+                "trust signals because replies do not flow back to the visible sender domain.".format(
+                    rel["from_registrable"], rel["replyto_registrable"]
+                ),
+                "Where possible, route replies through a subdomain of the From domain so the sender identity is "
+                "consistent end to end.",
             )
         )
 
@@ -3182,6 +3270,19 @@ def render_message_analysis_report(report: Dict[str, Any], use_color: bool = Tru
             lines.append("  From / Return-Path domains: SPLIT (ESP relay pattern)")
         elif deliverability.get("from_returnpath_match") is True:
             lines.append("  From / Return-Path domains: aligned")
+        rel = deliverability.get("replyto_relationship") or {}
+        if rel.get("relationship") == "lookalike":
+            lines.append(
+                "  Reply-To: LOOKALIKE of From ({0} vs {1}, sim={2})".format(
+                    rel.get("from_registrable"), rel.get("replyto_registrable"), rel.get("similarity"),
+                )
+            )
+        elif rel.get("relationship") == "different-registrable-domain":
+            lines.append(
+                "  Reply-To: different domain ({0} vs {1})".format(
+                    rel.get("from_registrable"), rel.get("replyto_registrable"),
+                )
+            )
         td = deliverability.get("tracking_redirector")
         if td:
             lines.append(
