@@ -20,10 +20,12 @@ Examples:
   python3 email_auth_audit.py example.com --smtp-probe --json
   python3 email_auth_audit.py --message-file sample.eml
   python3 email_auth_audit.py --targets-file domains.txt --json
-  python3 email_auth_audit.py example.com --ai-provider ollama --ai-model qwen3-coder-64k:latest
+  python3 email_auth_audit.py example.com --ai-provider ollama --ai-model gemma4:26b
   python3 email_auth_audit.py example.com --env-file .env
   python3 email_auth_audit.py example.com --ai-provider claude --ai-model your-claude-model --env-file .env
 """
+
+__version__ = "0.2.0"
 
 import argparse
 import base64
@@ -542,9 +544,27 @@ def parse_arc_authentication_results_header(value: str) -> Dict[str, Any]:
     return parsed
 
 
+CFBF_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+
+
+def _read_outlook_msg(path: str) -> email.message.Message:
+    try:
+        import extract_msg
+    except ImportError as exc:
+        raise SystemExit(
+            "Outlook .msg files require the 'extract-msg' package. Install it with: "
+            "pip install extract-msg"
+        ) from exc
+    with extract_msg.openMsg(path) as msg:
+        return msg.asEmailMessage()
+
+
 def read_message_file(path: str) -> email.message.Message:
     with open(path, "rb") as handle:
         content = handle.read()
+
+    if content.startswith(CFBF_MAGIC):
+        return _read_outlook_msg(path)
 
     if b"\n\n" in content or b"\r\n\r\n" in content:
         return BytesParser(policy=policy.default).parsebytes(content)
@@ -2556,7 +2576,7 @@ def normalize_ai_provider(provider: str) -> str:
 
 def default_model_for_provider(provider: str) -> str:
     if provider == "ollama":
-        return "qwen3-coder-64k:latest"
+        return "gemma4:26b"
     return ""
 
 

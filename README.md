@@ -106,7 +106,7 @@ Configure your AI analyst in `.env`. All advisors are **advisory only** — the 
 
 | Provider           | Identity                                          |
 |--------------------|---------------------------------------------------|
-| `ollama`           | Local holodeck (default: `qwen3-coder-64k:latest`)|
+| `ollama`           | Local holodeck (default: `gemma4:26b`)            |
 | `claude`           | Vulcan Science Officer (Anthropic)                |
 | `openai`           | Starfleet Command AI (OpenAI)                     |
 | `xai`              | Romulan defector model (xAI/Grok)                 |
@@ -168,8 +168,11 @@ python3 email_auth_audit.py example.com --output report.txt
 ### Intercepted-message analysis
 
 ```bash
-# Analyse a captured communiqué (.eml / raw headers)
+# Analyse a captured communiqué (.eml, .msg, or raw headers)
 python3 email_auth_audit.py --message-file suspicious.eml
+
+# Outlook .msg files are also accepted (requires extract-msg)
+python3 email_auth_audit.py --message-file "Mann ki Baat.msg"
 
 # Ask your holographic advisor a specific question about it
 python3 email_auth_audit.py --message-file suspicious.eml \
